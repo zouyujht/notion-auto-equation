@@ -4,14 +4,31 @@ import pandas as pd
 from notion_client import Client
 import logging
 import re
+import json
+import os
+import time
 
-NOTION_API_KEY = "your_notion_api_key_here"  # Replace with your Notion API key
-PAGE_ID = "your_page_id_here"  # Replace with your Notion page ID
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_API_KEY}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json"
-}
+# Load NOTION_API_KEY from project document (config.json)
+CONFIG_FILE = "config.json"
+HEADERS = {}
+
+def load_notion_api_key():
+    """
+    Load NOTION_API_KEY from config.json. If not found, guide user to create it.
+    """
+    if not os.path.exists(CONFIG_FILE):
+        logging.error(f"找不到 {CONFIG_FILE}，请在项目根目录创建该文件并写入 NOTION_API_KEY。示例: { '{"NOTION_API_KEY": "your_secret_key"}' }")
+        raise FileNotFoundError(f"缺少 {CONFIG_FILE}")
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        try:
+            cfg = json.load(f)
+        except json.JSONDecodeError:
+            logging.error(f"{CONFIG_FILE} 内容不是有效的 JSON，请修复后重试。")
+            raise
+    api_key = cfg.get("NOTION_API_KEY")
+    if not api_key:
+        raise ValueError("config.json 中缺少 NOTION_API_KEY")
+    return api_key
 
 # Setup logging
 logging.basicConfig(
@@ -20,53 +37,57 @@ logging.basicConfig(
 )
 
 # Used to recursively get all blocks and their child blocks
-def get_all_blocks(block_id):
+def get_all_blocks(block_id, max_retries=3):
     url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
     blocks = []
     has_more = True
     start_cursor = None
 
     while has_more:
-        try:
-            if start_cursor:
-                response = requests.get(url, headers=HEADERS, params={"start_cursor": start_cursor})
-            else:
-                response = requests.get(url, headers=HEADERS)
-            response.raise_for_status()
-            data = response.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Failed to fetch blocks: {e}")
-            break
-        except Exception as e:
-            logging.error(f"Unexpected error while fetching blocks: {e}")
-            break
+        attempt = 0
+        data = None
+        while attempt < max_retries:
+            try:
+                params = {"start_cursor": start_cursor} if start_cursor else None
+                response = requests.get(url, headers=HEADERS, params=params)
+                if response.ok:
+                    logging.info(f"访问成功：{url}")
+                response.raise_for_status()
+                data = response.json()
+                break
+            except requests.exceptions.RequestException as e:
+                attempt += 1
+                if attempt < max_retries:
+                    logging.warning(f"访问失败（第{attempt}次），准备重试... 错误：{e}")
+                    time.sleep(min(2 * attempt, 5))
+                else:
+                    logging.error(f"访问失败，已达到最大重试次数 {max_retries}。错误：{e}")
+                    return blocks
+            except Exception as e:
+                logging.error(f"获取 blocks 发生未预期错误：{e}")
+                return blocks
 
-        results = data.get('results', [])
+        results = data.get('results', []) if data else []
         for block in results:
             blocks.append(block)
             # If the block has children, recursively get them
             if block.get('has_children', False):
-                child_blocks = get_all_blocks(block['id'])
+                child_blocks = get_all_blocks(block['id'], max_retries=max_retries)
                 blocks.extend(child_blocks)
 
-        has_more = data.get('has_more', False)
-        start_cursor = data.get('next_cursor')
+        has_more = data.get('has_more', False) if data else False
+        start_cursor = data.get('next_cursor') if data else None
 
     logging.info(f"Fetched {len(blocks)} blocks from Notion.")
     return blocks
 
-def get_notion_page_content(page_id):
+def get_notion_page_content(page_id, max_retries=3):
     logging.info(f"Getting content for Notion page: {page_id}")
-    blocks = get_all_blocks(page_id)
+    blocks = get_all_blocks(page_id, max_retries=max_retries)
     if not blocks:
         logging.warning("No blocks found for the given page.")
     return blocks
 
-try:
-    page_content = get_notion_page_content(PAGE_ID)
-except Exception as e:
-    logging.error(f"Error getting Notion page content: {e}")
-    page_content = []
 
 ## Step 2: Convert blocks to DataFrame
 def blocks_to_dataframe(blocks):
@@ -103,11 +124,13 @@ def blocks_to_dataframe(blocks):
     logging.info(f"Converted {len(data)} blocks to DataFrame.")
     return pd.DataFrame(data)
 
-try:
-    df = blocks_to_dataframe(page_content)
-except Exception as e:
-    logging.error(f"Error converting blocks to DataFrame: {e}")
-    df = pd.DataFrame([])
+def to_dataframe_safe(blocks):
+    try:
+        df_local = blocks_to_dataframe(blocks)
+    except Exception as e:
+        logging.error(f"Error converting blocks to DataFrame: {e}")
+        df_local = pd.DataFrame([])
+    return df_local
 
 ## Step 3: Process content, extract formulas and format
 def format_content_for_notion(block):
@@ -233,12 +256,14 @@ def combine_text_and_equations(df):
 
     return combined_blocks
 
-try:
-    combined_data = combine_text_and_equations(df)
-    logging.info(f"Combined data contains {len(combined_data)} blocks.")
-except Exception as e:
-    logging.error(f"Error combining text and equations: {e}")
-    combined_data = []
+def combine_safe(df_local):
+    try:
+        combined = combine_text_and_equations(df_local)
+        logging.info(f"Combined data contains {len(combined)} blocks.")
+    except Exception as e:
+        logging.error(f"Error combining text and equations: {e}")
+        combined = []
+    return combined
 
 ##step 4 upload to notion
 def upload_to_notion(page_id, combined_blocks):
@@ -272,11 +297,40 @@ def upload_blocks_in_batches(page_id, combined_blocks, batch_size=10):
 
 
 def main():
+    # Load API key from config and set headers
+    api_key = load_notion_api_key()
+    global HEADERS
+    HEADERS = {
+        "Authorization": f"Bearer {api_key}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
+
+    # Prompt PAGE_ID at runtime
+    page_id = input("请输入 Notion 页面 ID（PAGE_ID）: ").strip()
+
+    # Optional: set retry count
+    retry_input = input("请输入最大重试次数(默认3): ").strip()
+    try:
+        max_retries = int(retry_input) if retry_input else 3
+    except ValueError:
+        logging.warning("输入的重试次数不是有效数字，默认使用 3 次重试。")
+        max_retries = 3
+
+    # Try to fetch content to confirm access success
+    page_content = get_notion_page_content(page_id, max_retries=max_retries)
+
+    # If only access confirmation is required, we already logged success when fetching.
+    # Continue original flow: convert and upload
+    df_local = to_dataframe_safe(page_content)
+    combined_data = combine_safe(df_local)
+
     # Prompt user to manually clear page content in Notion
-    input("Please manually clear all content on the Notion page, then press Enter to continue... ")
+    input("请先在 Notion 页面中手动清空内容，然后按回车继续上传... ")
+
     # Proceed to upload processed blocks in batches
     if combined_data:
-        upload_blocks_in_batches(PAGE_ID, combined_data, batch_size=10)
+        upload_blocks_in_batches(page_id, combined_data, batch_size=10)
     else:
         logging.warning("No data to upload to Notion.")
 
